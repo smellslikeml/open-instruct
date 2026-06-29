@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
 
 
 ### Added
+- Add a `prefix_sharing_stats` diagnostic that logs shared-prefix redundancy (redundant token fraction and estimated token speedup) for the DPO training dataset at startup in `dpo_tune_cache.py` (https://github.com/smellslikeml/open-instruct/pull/3).
 - Drop stale async rollout results whose generating policy is more than `async_steps` behind the trainer (`max_result_age_steps`), replenishing a fresh prompt and logging a `stale_results_dropped` metric (https://github.com/allenai/open-instruct/pull/1738).
 
 ### Changed
