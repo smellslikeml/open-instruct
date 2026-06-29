@@ -55,6 +55,7 @@ from open_instruct.dataset_transformation import (
     visualize_token,
 )
 from open_instruct.padding_free_collator import TensorDataCollatorWithFlatteningDPO
+from open_instruct.prefix_sharing_stats import log_prefix_sharing_stats
 from open_instruct.utils import (
     ArgumentParserPlus,
     ModelDims,
@@ -400,6 +401,10 @@ def main(args: dpo_utils.DPOExperimentConfig, tc: TokenizerConfig):
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 3):
         logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+
+    # Report how much of this preference data is redundant shared prompt prefix,
+    # i.e. the throughput headroom available from prefix sharing (arxiv 2410.20305).
+    log_prefix_sharing_stats(train_dataset)
 
     # DataLoaders creation:
     if args.packing:
