@@ -33,6 +33,10 @@ on:
         description: 'Pinned arxiv_id (must already be in the candidate pool).'
         required: false
         default: ''
+      claude-timeout:
+        description: 'Wall-clock seconds for the Claude Code implementation step.'
+        required: false
+        default: '900'
 
 jobs:
   recommend:
@@ -81,6 +85,7 @@ jobs:
       - uses: remyxai/outrider@v1
         with:
           interest-id: 649828cc-11ec-4ce5-9549-303d1da6f1ce
+          claude-timeout: ${{ inputs.claude-timeout }}
           pin-method: ${{ inputs.pin-method }}
           pin-arxiv: ${{ inputs.pin-arxiv }}
           model-base-url: ${{ inputs.backend == 'glm' && 'https://api.z.ai/api/anthropic' || '' }}
