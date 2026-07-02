@@ -17,7 +17,7 @@ import wandb
 from datasets import Dataset
 
 from open_instruct import data_loader as data_loader_lib
-from open_instruct import data_types, logger_utils, model_utils, olmo_core_utils, utils
+from open_instruct import data_types, logger_utils, model_utils, olmo_core_utils, rsi_token_selection, utils
 from open_instruct.rl_utils import masked_mean
 from open_instruct.utils import (
     INVALID_LOGPROB,
@@ -131,6 +131,17 @@ class GRPOExperimentConfig(
     maintains same rho for correction but masks using bounds and sequence-level TV divergence abs(p_seq - 1)
     won't mask tokens that purport to decrease TV divergence: advantage * logprob_diff <= 0
     """
+    use_rsi_selection: bool = False
+    """Master switch for RSI Selection (RSI-S, https://arxiv.org/abs/2606.31575).
+    When True, an entropy-adaptive per-token keep-mask is composed on top of the ρ
+    weighting: tokens whose Relative Surprisal Index (surprisal / predictive entropy)
+    falls outside [rsi_lower_bound, rsi_upper_bound] have their per-token policy loss
+    zeroed, dropping redundant low-surprisal tokens and unstable high-surprisal tail
+    tokens. Requires `record_entropy=True` (RSI needs the predictive entropy)."""
+    rsi_lower_bound: float = 0.0
+    """Tokens with RSI below this value are dropped (0 disables the lower cut)."""
+    rsi_upper_bound: float = 0.0
+    """Tokens with RSI above this value are dropped (0 disables the upper cut)."""
     kl_estimator: Literal[0, 1, 2, 3] = 2
     """the KL estimator to use"""
     loss_denominator: str = "token"
@@ -335,6 +346,26 @@ class GRPOExperimentConfig(
                 )
             if self.rho_clamp_upper_bound > 0.0 and self.rho_clamp_upper_bound <= 1.0:
                 raise ValueError(f"rho_clamp_upper_bound must be > 1 when set, got {self.rho_clamp_upper_bound}.")
+        if self.use_rsi_selection:
+            if not self.record_entropy:
+                raise ValueError(
+                    "`use_rsi_selection` requires `record_entropy=True`: RSI is derived from the "
+                    "predictive entropy, which is only computed when entropy recording is enabled."
+                )
+            if self.rsi_lower_bound < 0.0 or self.rsi_upper_bound < 0.0:
+                raise ValueError(
+                    f"rsi_lower_bound / rsi_upper_bound must be >= 0, got "
+                    f"{self.rsi_lower_bound} and {self.rsi_upper_bound}."
+                )
+            if (
+                self.rsi_lower_bound > 0.0
+                and self.rsi_upper_bound > 0.0
+                and self.rsi_lower_bound >= self.rsi_upper_bound
+            ):
+                raise ValueError(
+                    f"rsi_lower_bound ({self.rsi_lower_bound}) must be < rsi_upper_bound "
+                    f"({self.rsi_upper_bound}) when both are set."
+                )
 
 
 def mask_logprobs(vllm_logprobs: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
@@ -686,6 +717,7 @@ _SCALAR_LOSS_STAT_KEYS = [
     "val/rho_drop_frac",
     "val/rho_drop_low_frac",
     "val/rho_drop_high_frac",
+    *rsi_token_selection.RSI_METRIC_KEYS,
 ]
 
 

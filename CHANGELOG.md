@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
 
 
 ### Added
+- Add RSI Selection (RSI-S), an entropy-adaptive per-token keep-mask for GRPO gated by `use_rsi_selection`/`rsi_lower_bound`/`rsi_upper_bound`, that drops redundant low-surprisal and unstable high-surprisal tail tokens by their Relative Surprisal Index (surprisal / predictive entropy) and composes multiplicatively with the existing `rho` weighting in `compute_grpo_loss`; adapted from "Which Tokens Matter? Adaptive Token Selection for RLVR with the Relative Surprisal Index" (https://arxiv.org/abs/2606.31575) (https://github.com/allenai/open-instruct/pull/1739).
 - Drop stale async rollout results whose generating policy is more than `async_steps` behind the trainer (`max_result_age_steps`), replenishing a fresh prompt and logging a `stale_results_dropped` metric (https://github.com/allenai/open-instruct/pull/1738).
 
 ### Changed
