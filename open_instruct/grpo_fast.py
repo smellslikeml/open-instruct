@@ -41,7 +41,7 @@ with contextlib.suppress(Exception):
     from deepspeed.utils import groups
 
 from open_instruct import data_loader as data_loader_lib
-from open_instruct import grpo_utils, utils
+from open_instruct import grpo_utils, rsi_token_selection, utils
 from open_instruct.data_loader import add_prompt_to_generator
 from open_instruct.data_types import EnvConfig, EnvConfigEntry
 from open_instruct.rubrics.evolving_rubric_step import RUBRIC_TABLE_COLUMNS, RUBRIC_TABLE_KEY
@@ -706,13 +706,28 @@ class PolicyTrainerRayProcess(RayProcess):
                     )
                     grpo_utils.accumulate_rho_histograms(rho_histograms, rho_BT)
 
+                    # RSI-S: entropy-adaptive per-token keep-mask composed on top of the ρ
+                    # weighting (https://arxiv.org/abs/2606.31575).
+                    policy_weights_BT = rho_BT.weights
+                    policy_metrics = rho_BT.metrics
+                    if self.args.use_rsi_selection:
+                        rsi_BT = rsi_token_selection.compute_rsi_selection(
+                            new_logprobs_BT,
+                            entropy_BT,
+                            response_mask_BT,
+                            self.args.rsi_lower_bound,
+                            self.args.rsi_upper_bound,
+                        )
+                        policy_weights_BT = policy_weights_BT * rsi_BT.weights
+                        policy_metrics = {**policy_metrics, **rsi_BT.metrics}
+
                     pg_loss_BT, clipfrac_BT, kl_BT = grpo_utils.compute_grpo_loss(
                         new_logprobs=new_logprobs_BT,
                         ratio=ratio_BT,
                         advantages=data_BT.advantages[i][:, 1:],
                         ref_logprobs=ref_logprobs_BT[i] if self.args.load_ref_policy else None,
                         config=self.args,
-                        rho_weights=rho_BT.weights,
+                        rho_weights=policy_weights_BT,
                     )
 
                     per_token_loss_BT = pg_loss_BT + self.args.beta * kl_BT
@@ -745,7 +760,7 @@ class PolicyTrainerRayProcess(RayProcess):
                         ref_logprobs_BT[i] if self.args.load_ref_policy else None,
                         entropy_BT,
                         self.args,
-                        rho_metrics=rho_BT.metrics,
+                        rho_metrics=policy_metrics,
                     )
 
             batch_metrics = batch_data["metrics"]
