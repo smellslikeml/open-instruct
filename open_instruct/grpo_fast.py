@@ -41,7 +41,7 @@ with contextlib.suppress(Exception):
     from deepspeed.utils import groups
 
 from open_instruct import data_loader as data_loader_lib
-from open_instruct import grpo_utils, utils
+from open_instruct import control_token_monitor, grpo_utils, utils
 from open_instruct.data_loader import add_prompt_to_generator
 from open_instruct.data_types import EnvConfig, EnvConfigEntry
 from open_instruct.rubrics.evolving_rubric_step import RUBRIC_TABLE_COLUMNS, RUBRIC_TABLE_KEY
@@ -307,6 +307,11 @@ class PolicyTrainerRayProcess(RayProcess):
         # ------------------------------------------------------------
         self.args = args
         self.tokenizer = tokenizer
+        # Resolve tool-call control-token ids once (arXiv:2606.26027 collapse diagnostic).
+        # Empty when the monitor is off or no control tokens map to single vocab ids.
+        self.control_token_ids = (
+            control_token_monitor.resolve_control_token_ids(tokenizer) if args.record_control_token_mass else []
+        )
         self.model_config = model_config
         self.beaker_config = beaker_config
         self.wandb_url = wandb_url
@@ -647,7 +652,12 @@ class PolicyTrainerRayProcess(RayProcess):
         rho_histograms: dict[str, list[torch.Tensor]] = {}
         # Do multiple epochs of training on on-policy data (PPO-style), with a fresh random shuffle in each epoch
         with Timer("[Training Processes] Loss calculation", noop=self.rank != 0):
-            loss_stats_B = grpo_utils.create_loss_stats(num_samples, device, record_entropy=self.args.record_entropy)
+            loss_stats_B = grpo_utils.create_loss_stats(
+                num_samples,
+                device,
+                record_entropy=self.args.record_entropy,
+                record_control_token_mass=self.args.record_control_token_mass,
+            )
             for epoch_idx in range(self.args.num_epochs):
                 # Pre-compute total tokens for each accumulation group if using "token" normalization
                 # This ensures all minibatches in an accumulation group are normalized by the same total
@@ -666,7 +676,7 @@ class PolicyTrainerRayProcess(RayProcess):
                     loss_denominator = accumulation_token_counts[batch_start]
                     # Pass attention_mask=None so HF constructs the correct 3D intra-document
                     # mask from position_ids internally for packed sequences.
-                    local_logprobs_BT, entropy_BT = grpo_utils.forward_for_logprobs(
+                    local_logprobs_BT, entropy_BT, control_mass_BT = grpo_utils.forward_for_logprobs(
                         self.model,
                         data_BT.query_responses[i],
                         None,
@@ -674,6 +684,8 @@ class PolicyTrainerRayProcess(RayProcess):
                         self.pad_token_id,
                         self.streaming_config.temperature,
                         return_entropy=self.args.record_entropy,
+                        return_control_token_mass=self.args.record_control_token_mass,
+                        control_token_ids=self.control_token_ids,
                     )
                     local_logprobs_BT = grpo_utils.mask_logprobs(local_logprobs_BT, response_mask_BT)
                     vllm_logprobs_BT = grpo_utils.mask_logprobs(data_BT.vllm_logprobs[i][:, 1:], response_mask_BT)
@@ -746,6 +758,7 @@ class PolicyTrainerRayProcess(RayProcess):
                         entropy_BT,
                         self.args,
                         rho_metrics=rho_BT.metrics,
+                        control_token_mass=control_mass_BT,
                     )
 
             batch_metrics = batch_data["metrics"]
@@ -1572,6 +1585,7 @@ def one_training_step(
         "loss/total_avg",
         "policy/clipfrac_avg",
         "policy/entropy_avg",
+        "policy/control_token_mass_avg",
         "val/ratio",
         "val/ratio_var",
         "val/rho_drop_frac",

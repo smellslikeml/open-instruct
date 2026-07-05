@@ -16,8 +16,8 @@ import torch.distributed as dist
 import wandb
 from datasets import Dataset
 
+from open_instruct import control_token_monitor, data_types, logger_utils, model_utils, olmo_core_utils, utils
 from open_instruct import data_loader as data_loader_lib
-from open_instruct import data_types, logger_utils, model_utils, olmo_core_utils, utils
 from open_instruct.rl_utils import masked_mean
 from open_instruct.utils import (
     INVALID_LOGPROB,
@@ -151,6 +151,12 @@ class GRPOExperimentConfig(
     """Whether to use DAPO or CISPO loss function."""
     record_entropy: bool = False
     """whether to record the entropy of the policy during training. Uses extra memory."""
+    record_control_token_mass: bool = False
+    """whether to record the policy's per-step probability mass on tool-call control tokens
+    (e.g. ``<|im_start|>``, ``<tool_response>``) during training. Adapted from "Why Multi-Step
+    Tool-Use RL Collapses..." (arXiv:2606.26027), which attributes tool-use RL collapse to spikes
+    on these tokens. Costs one softmax over the already-materialized logits; off by default → no
+    behavior change."""
     use_vllm_logprobs: bool = False
     """whether to use vLLM's logprobs for training instead of calculating them via forward pass"""
 
@@ -547,8 +553,18 @@ def forward_for_logprobs(
     temperature: float,
     return_entropy: bool = False,
     pass_olmo_core_doc_lens: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Forward pass to compute log probabilities."""
+    return_control_token_mass: bool = False,
+    control_token_ids: list[int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Forward pass to compute log probabilities.
+
+    When ``return_control_token_mass`` is set, a third tensor is returned: the
+    per-position probability mass the policy places on ``control_token_ids``
+    (the tool-call structural markers) — the collapse signature from
+    arXiv:2606.26027. It reuses the logits already computed here, so it costs
+    one ``softmax`` and never an extra forward pass. Off by default, in which
+    case the historical ``(logprob_BT, entropy)`` 2-tuple is returned unchanged.
+    """
     extra_kwargs = {}
     if pass_olmo_core_doc_lens:
         assert attention_mask is not None
@@ -565,12 +581,18 @@ def forward_for_logprobs(
     labels[labels == pad_token_id] = 0
     logprob_BT = model_utils.log_softmax_and_gather(logits, labels)
 
-    # For now, entropy is just for monitoring, and we don't pass gradients through it.
+    # For now, entropy / control-token mass are just for monitoring, and we don't
+    # pass gradients through them.
     entropy = None
-    if return_entropy:
-        with torch.no_grad():
+    control_mass_BT = None
+    with torch.no_grad():
+        if return_entropy:
             entropy = model_utils.entropy_from_logits(logits)
+        if return_control_token_mass and control_token_ids:
+            control_mass_BT = control_token_monitor.control_token_mass(logits, control_token_ids)
 
+    if return_control_token_mass:
+        return logprob_BT, entropy, control_mass_BT
     return logprob_BT, entropy
 
 
@@ -689,10 +711,14 @@ _SCALAR_LOSS_STAT_KEYS = [
 ]
 
 
-def create_loss_stats(num_samples: int, device: torch.device, record_entropy: bool = False) -> dict[str, torch.Tensor]:
+def create_loss_stats(
+    num_samples: int, device: torch.device, record_entropy: bool = False, record_control_token_mass: bool = False
+) -> dict[str, torch.Tensor]:
     stats = {key: torch.zeros(num_samples, device=device) for key in _SCALAR_LOSS_STAT_KEYS}
     if record_entropy:
         stats |= {"policy/entropy_avg": torch.zeros(num_samples, device=device)}
+    if record_control_token_mass:
+        stats |= {"policy/control_token_mass_avg": torch.zeros(num_samples, device=device)}
     return stats
 
 
@@ -709,6 +735,7 @@ def populate_sample_loss_stats(
     entropy: torch.Tensor | None,
     config: GRPOExperimentConfig,
     rho_metrics: dict[str, torch.Tensor] | None = None,
+    control_token_mass: torch.Tensor | None = None,
 ) -> None:
     with torch.no_grad():
         if config.load_ref_policy and ref_logprobs is not None:
@@ -727,6 +754,10 @@ def populate_sample_loss_stats(
         loss_stats_B["val/ratio"][sample_idx] = masked_mean(ratio, response_mask)
         if entropy is not None:
             loss_stats_B["policy/entropy_avg"][sample_idx] = masked_mean(entropy, response_mask).float()
+        if control_token_mass is not None:
+            loss_stats_B["policy/control_token_mass_avg"][sample_idx] = masked_mean(
+                control_token_mass, response_mask
+            ).float()
 
 
 def compute_metrics_from_loss_stats(
