@@ -25,7 +25,7 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 from transformers import PreTrainedTokenizer
 
 from open_instruct import data_loader as data_loader_lib
-from open_instruct import dpo_utils, grpo_utils, logger_utils, model_utils, padding_free_collator
+from open_instruct import dpo_utils, grpo_utils, logger_utils, model_utils, padding_free_collator, rsi_token_selection
 from open_instruct.rl_utils import masked_mean
 
 logger = logger_utils.setup_logger(__name__)
@@ -552,13 +552,28 @@ class GRPOTrainModule(TransformerTrainModule):
                 )
                 grpo_utils.accumulate_rho_histograms(rho_histograms, rho)
 
+                # RSI-S: entropy-adaptive per-token keep-mask composed on top of the ρ
+                # weighting (https://arxiv.org/abs/2606.31575).
+                policy_weights = rho.weights
+                policy_metrics = rho.metrics
+                if self.grpo_config.use_rsi_selection:
+                    rsi = rsi_token_selection.compute_rsi_selection(
+                        new_logprobs,
+                        entropy,
+                        response_mask,
+                        self.grpo_config.rsi_lower_bound,
+                        self.grpo_config.rsi_upper_bound,
+                    )
+                    policy_weights = policy_weights * rsi.weights
+                    policy_metrics = {**policy_metrics, **rsi.metrics}
+
                 pg_loss, clipfrac, kl = grpo_utils.compute_grpo_loss(
                     new_logprobs=new_logprobs,
                     ratio=ratio,
                     advantages=advantages[:, 1:],
                     ref_logprobs=ref_logprobs_BT[sample_idx] if ref_logprobs_BT is not None else None,
                     config=self.grpo_config,
-                    rho_weights=rho.weights,
+                    rho_weights=policy_weights,
                 )
 
                 batch_start = (sample_idx // accumulation_steps) * accumulation_steps
@@ -580,7 +595,7 @@ class GRPOTrainModule(TransformerTrainModule):
                     ref_logprobs_BT[sample_idx] if ref_logprobs_BT is not None else None,
                     entropy,
                     self.grpo_config,
-                    rho_metrics=rho.metrics,
+                    rho_metrics=policy_metrics,
                 )
 
                 num_steps += 1
